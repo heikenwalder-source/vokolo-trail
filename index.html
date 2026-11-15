@@ -10,7 +10,7 @@
 <title>Trénink Vokolo Trail</title>
 <meta name="robots" content="noindex,nofollow">
 <meta name="referrer" content="no-referrer">
-<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; img-src 'self' data:; connect-src 'none'; base-uri 'none'; form-action 'none'">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; img-src 'self' data:; connect-src https://api.github.com; base-uri 'none'; form-action 'none'">
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 24'%3E%3Crect width='32' height='24' rx='3' fill='%23fff'/%3E%3Crect y='8' width='32' height='8' fill='%23CF2229'/%3E%3C/svg%3E">
 <style>:root{color-scheme:light;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}body{margin:0;font:14px system-ui,sans-serif}img{max-width:100%}[hidden]{display:none!important}</style>
 </head>
@@ -289,7 +289,7 @@ function pref(k, v){ try { if (v === undefined) return localStorage.getItem('tre
 
 /* ---------- Sync (Claude account store when available) ---------- */
 var docRef = null, sync = 'local', writing = false, again = false, wTimer = null;
-function persist(){ state.updatedAt = new Date().toISOString(); saveLocal(); if (docRef){ clearTimeout(wTimer); wTimer = setTimeout(flush, 500); } }
+function persist(){ state.updatedAt = new Date().toISOString(); saveLocal(); if (docRef){ clearTimeout(wTimer); wTimer = setTimeout(flush, 500); } if (ghToken){ clearTimeout(ghTimer); ghTimer = setTimeout(ghSync, 1200); } }
 function flush(){
   if (!docRef) return;
   if (writing){ again = true; return; }
@@ -322,6 +322,72 @@ function connect(){
     }, function(){ clearTimeout(timer); sync = 'error'; docRef = null; renderSync(); });
   }, function(){ sync = 'local'; renderSync(); });
 }
+
+/* ---------- Sync between devices (private GitHub repo, token stays in this browser only) ---------- */
+var GH_API = 'https://api.github.com/repos/heikenwalder-source/vokolo-trail-data/contents/stav.json';
+var TOKEN_KEY = 'trenink-sync-token', BASE_KEY = 'trenink-sync-base';
+var ghToken = '', ghBase = null, ghSha = null, ghBusy = false, ghAgain = false, ghTimer = null, ghState = 'idle', ghLast = 0;
+try { ghToken = localStorage.getItem(TOKEN_KEY) || ''; var rawBase = localStorage.getItem(BASE_KEY); if (rawBase) ghBase = mergeState(JSON.parse(rawBase)); } catch(e) {}
+function b64e(str){ var b = new TextEncoder().encode(str), s = ''; for (var i = 0; i < b.length; i++) s += String.fromCharCode(b[i]); return btoa(s); }
+function b64d(b){ var s = atob(String(b).replace(/\s/g, '')), a = new Uint8Array(s.length); for (var i = 0; i < s.length; i++) a[i] = s.charCodeAt(i); return new TextDecoder().decode(a); }
+function ghReq(method, body){
+  return fetch(GH_API, { method:method, cache:'no-store', headers:{ 'Authorization':'Bearer ' + ghToken, 'Accept':'application/vnd.github+json' }, body:body ? JSON.stringify(body) : undefined });
+}
+/* Three-way merge: what this device changed since the last sync wins, everything else comes from the other device. */
+function mapMerge(b, l, r){
+  var o = {}, keys = {};
+  b = b || {}; l = l || {}; r = r || {};
+  Object.keys(r).forEach(function(k){ o[k] = r[k]; });
+  Object.keys(b).concat(Object.keys(l)).forEach(function(k){ keys[k] = 1; });
+  Object.keys(keys).forEach(function(k){
+    if (JSON.stringify(l[k]) === JSON.stringify(b[k])) return;
+    if (l[k] === undefined) delete o[k]; else o[k] = l[k];
+  });
+  return o;
+}
+function byId(a){ var o = {}; (a || []).forEach(function(x){ if (x && x.id) o[x.id] = x; }); return o; }
+function merge3(base, local, remote){
+  var ex = mapMerge(byId(base.extras), byId(local.extras), byId(remote.extras));
+  return { v:1, config:fixName(Object.assign({}, DEFAULT_CONFIG, mapMerge(base.config, local.config, remote.config))),
+    done:mapMerge(base.done, local.done, remote.done), moves:mapMerge(base.moves, local.moves, remote.moves), modes:mapMerge(base.modes, local.modes, remote.modes),
+    extras:Object.keys(ex).map(function(k){ return ex[k]; }),
+    updatedAt:(local.updatedAt || '') > (remote.updatedAt || '') ? local.updatedAt : (remote.updatedAt || '') };
+}
+function ghSetBase(json){ ghBase = JSON.parse(json); try { localStorage.setItem(BASE_KEY, json); } catch(e) {} }
+function ghSync(){
+  if (!ghToken) return;
+  if (ghBusy){ ghAgain = true; return; }
+  ghBusy = true; ghLast = Date.now(); clearTimeout(ghTimer);
+  if (ghState !== 'ok'){ ghState = 'busy'; renderSync(); }
+  var tok = ghToken;
+  ghReq('GET').then(function(r){
+    if (r.status === 404) return null;
+    if (r.status === 401 || r.status === 403) throw { auth:true };
+    if (!r.ok) throw {};
+    return r.json();
+  }).then(function(j){
+    if (tok !== ghToken) return;
+    var local = JSON.parse(JSON.stringify(state)), localJson = JSON.stringify(local), merged = local, remoteJson = null;
+    ghSha = j ? j.sha : null;
+    if (j){ var remote = mergeState(JSON.parse(b64d(j.content))); remoteJson = JSON.stringify(remote); merged = merge3(ghBase || freshState(), local, remote); }
+    var mj = JSON.stringify(merged);
+    if (mj !== localJson){ state = JSON.parse(mj); saveLocal(); renderAll(); if (current === 'nastaveni' && !document.activeElement.closest('#cfg-form')) renderSettings(); }
+    if (mj === remoteJson){ ghSetBase(mj); return; }
+    var body = { message:'sync', content:b64e(mj) }; if (ghSha) body.sha = ghSha;
+    return ghReq('PUT', body).then(function(r){
+      if (r.status === 409 || r.status === 422){ ghAgain = true; return; }
+      if (r.status === 401 || r.status === 403 || r.status === 404) throw { auth:true };
+      if (!r.ok) throw {};
+      return r.json().then(function(x){ ghSha = x.content && x.content.sha; ghSetBase(mj); });
+    });
+  }).then(function(){ if (tok === ghToken) ghState = 'ok'; }, function(e){ if (tok === ghToken) ghState = e && e.auth ? 'auth' : 'error'; })
+  .then(function(){ ghBusy = false; renderSync(); if (ghAgain){ ghAgain = false; if (ghState === 'ok') ghSync(); } });
+}
+function ghPoll(){ if (ghToken && !document.hidden && Date.now() - ghLast > 10000) ghSync(); }
+document.addEventListener('visibilitychange', ghPoll);
+window.addEventListener('focus', ghPoll);
+window.addEventListener('online', ghPoll);
+setInterval(ghPoll, 60000);
 
 /* ---------- Exercise library ---------- */
 var EX = {
@@ -714,6 +780,12 @@ function renderFood(){
 }
 
 function syncHTML(){
+  if (ghToken){
+    var g = { ok:['ok', 'Synchronizováno. Stejné záznamy uvidíš na telefonu i v počítači.'],
+      auth:['warn', 'Přístupový kód nefunguje nebo nemá přístup k úložišti. Odpoj zařízení a zadej ho znovu.'],
+      error:['warn', 'Teď se nepodařilo spojit. Záznamy zůstávají v zařízení, zkusím to znovu.'] }[ghState] || ['warn', 'Synchronizuju…'];
+    return '<p class="sync ' + g[0] + '"><i></i><span>' + g[1] + '</span></p>';
+  }
   var m = { local:['', inArtifact() ? 'Ukládá se jen v tomto prohlížeči.' : 'Ukládá se jen v tomto prohlížeči na tomhle zařízení.'],
     connecting:['warn', 'Připojuju úložiště v účtu Claude…'], synced:['ok', 'Uloženo v účtu Claude. Stejné záznamy uvidíš na mobilu i počítači.'],
     offline:['warn', 'Úložiště zatím neodpovídá. Ukládám do prohlížeče a zkusím to znovu.'], readonly:['warn', 'Tady můžeš jen číst. Záznamy se ukládají do prohlížeče.'],
@@ -736,7 +808,11 @@ function renderSettings(){
     '<p id="cfg-err" class="muted" hidden></p>' +
     '<div class="btns"><button class="btn primary" type="submit">Uložit a přepočítat</button><button class="btn ghost" type="button" data-act="cfgdefault">Výchozí hodnoty</button></div>' +
     '</form></section>';
-  h += '<section class="card"><h2>Ukládání</h2><div id="sync-line">' + syncHTML() + '</div>' +
+  h += '<section class="card"><h2>Ukládání a synchronizace</h2><div id="sync-line">' + syncHTML() + '</div>' +
+    (ghToken ? '<div class="btns"><button class="btn" data-act="ghnow">Synchronizovat teď</button><button class="btn ghost" data-act="ghoff">Odpojit toto zařízení</button></div>'
+      : '<p class="focus">Aby se záznamy přenášely mezi telefonem a počítačem, vlož na každém zařízení přístupový kód ke svému soukromému úložišti na GitHubu. Kód zůstane jen v tomto prohlížeči.</p>' +
+        '<div class="field"><label for="gh-token">Přístupový kód</label><input id="gh-token" type="password" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="github_pat_…"></div>' +
+        '<div class="btns"><button class="btn primary" data-act="ghon">Připojit</button></div>') +
     '<div class="btns">' + (resetArmed ? '<button class="btn danger" data-act="resetgo">Ano, smazat záznamy</button><button class="btn ghost" data-act="resetno">Zpět</button>' : '<button class="btn danger" data-act="reset">Smazat odškrtnutí a přesuny</button>') + '</div></section>';
   h += '<section class="card"><h2>Jak plán funguje</h2><p class="focus">Plán se počítá od data závodu dozadu ve fázích Udržet, Stavět, Vrchol, Ladit a Závod. Dlouhý běh roste nejvýš o kilometr za týden a každý čtvrtý týden je odpočinkový. Tři týdny před závodem přijde nejdelší běh, pak se ubírá.</p>' +
     '<p class="focus">Barvy fází jsou turistické značky. Režim týdne „Minimum“ se hodí na cesty a nemoc, „Bez navyšování“ na náročné týdny v práci.</p></section>';
@@ -848,6 +924,13 @@ document.addEventListener('click', function(ev){
       persist(); renderSheet(); break; }
     case 'ics': { var s3 = findAny(sheetId); if (s3) icsDownload(s3, sheetAbs(s3), $('#cal-time').value || '07:00'); break; }
     case 'cfgdefault': { var keep = state.config; state.config = Object.assign({}, DEFAULT_CONFIG); renderSettings(); state.config = keep; toast('Výchozí hodnoty doplněné, ulož je'); break; }
+    case 'ghon': { var tv = ($('#gh-token').value || '').trim();
+      if (!/^(github_pat_|ghp_)\w{20,}$/.test(tv)){ toast('To nevypadá jako přístupový kód'); break; }
+      ghToken = tv; ghState = 'busy'; try { localStorage.setItem(TOKEN_KEY, tv); } catch(e) {}
+      renderSettings(); ghSync(); break; }
+    case 'ghoff': ghToken = ''; ghBase = null; ghSha = null; ghState = 'idle'; try { localStorage.removeItem(TOKEN_KEY); localStorage.removeItem(BASE_KEY); } catch(e) {}
+      renderSettings(); toast('Zařízení odpojeno'); break;
+    case 'ghnow': ghSync(); toast('Synchronizuju'); break;
     case 'reset': resetArmed = true; renderSettings(); break;
     case 'resetno': resetArmed = false; renderSettings(); break;
     case 'resetgo': resetArmed = false; state.done = {}; state.moves = {}; state.extras = []; persist(); renderAll(); renderSettings(); toast('Záznamy smazané'); break;
@@ -896,7 +979,7 @@ function renderAll(){
   if (sheetId) renderSheet();
 }
 
-renderAll(); show(); connect();
+renderAll(); show(); connect(); ghSync();
 })();
 </script>
 
